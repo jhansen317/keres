@@ -39,13 +39,18 @@ func Analyze(client *http.Client, limit int) error {
 	if err != nil {
 		return fmt.Errorf("unable to create Gmail service: %w", err)
 	}
+	rl := newAPILimiter()
 
 	fmt.Println("Analyzing your Gmail account...")
 	fmt.Println("This may take a few minutes for large accounts.\n")
 
 	// Get user profile
-	profile, err := srv.Users.GetProfile("me").Do()
-	if err != nil {
+	var profile *gmail.Profile
+	if err := rl.do(ctx, func() error {
+		var err error
+		profile, err = srv.Users.GetProfile("me").Do()
+		return err
+	}); err != nil {
 		return fmt.Errorf("unable to get profile: %w", err)
 	}
 
@@ -55,7 +60,7 @@ func Analyze(client *http.Client, limit int) error {
 	fmt.Printf("Storage used: %s\n\n", formatBytes(profile.MessagesTotal*1024)) // Approximate
 
 	// Analyze emails
-	stats, err := analyzeEmails(srv, limit)
+	stats, err := analyzeEmails(ctx, srv, rl, limit)
 	if err != nil {
 		return err
 	}
@@ -64,7 +69,7 @@ func Analyze(client *http.Client, limit int) error {
 	return nil
 }
 
-func analyzeEmails(srv *gmail.Service, limit int) (*EmailStats, error) {
+func analyzeEmails(ctx context.Context, srv *gmail.Service, rl *apiLimiter, limit int) (*EmailStats, error) {
 	stats := &EmailStats{
 		TopSenders:        make(map[string]int),
 		CategoryBreakdown: make(map[string]int),
@@ -82,13 +87,17 @@ func analyzeEmails(srv *gmail.Service, limit int) (*EmailStats, error) {
 			req = req.PageToken(pageToken)
 		}
 
-		res, err := req.Do()
-		if err != nil {
+		var res *gmail.ListMessagesResponse
+		if err := rl.do(ctx, func() error {
+			var err error
+			res, err = req.Do()
+			return err
+		}); err != nil {
 			return nil, fmt.Errorf("unable to list messages: %w", err)
 		}
 
 		// Process messages in parallel
-		stats = processBatch(srv, res.Messages, stats)
+		stats = processBatch(ctx, srv, rl, res.Messages, stats)
 		processed += len(res.Messages)
 
 		fmt.Printf("\rProcessed %d emails...", processed)
@@ -103,7 +112,7 @@ func analyzeEmails(srv *gmail.Service, limit int) (*EmailStats, error) {
 	return stats, nil
 }
 
-func processBatch(srv *gmail.Service, messages []*gmail.Message, stats *EmailStats) *EmailStats {
+func processBatch(ctx context.Context, srv *gmail.Service, rl *apiLimiter, messages []*gmail.Message, stats *EmailStats) *EmailStats {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -116,8 +125,12 @@ func processBatch(srv *gmail.Service, messages []*gmail.Message, stats *EmailSta
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			m, err := srv.Users.Messages.Get("me", msgID).Format("metadata").Do()
-			if err != nil {
+			var m *gmail.Message
+			if err := rl.do(ctx, func() error {
+				var err error
+				m, err = srv.Users.Messages.Get("me", msgID).Format("metadata").Do()
+				return err
+			}); err != nil {
 				return
 			}
 
@@ -218,12 +231,13 @@ func CleanOldUnread(client *http.Client, days int, action string, dryRun bool, s
 	if err != nil {
 		return fmt.Errorf("unable to create Gmail service: %w", err)
 	}
+	rl := newAPILimiter()
 
 	cutoffDate := time.Now().AddDate(0, 0, -days)
 	query := fmt.Sprintf("is:unread before:%s", cutoffDate.Format("2006/01/02"))
 
 	fmt.Printf("Searching for unread emails older than %d days...\n", days)
-	messages, err := searchMessages(srv, query)
+	messages, err := searchMessages(ctx, srv, rl, query)
 	if err != nil {
 		return err
 	}
@@ -234,7 +248,7 @@ func CleanOldUnread(client *http.Client, days int, action string, dryRun bool, s
 	}
 
 	if skipReplied {
-		messages, err = filterOutRepliedTo(srv, messages)
+		messages, err = filterOutRepliedTo(ctx, srv, rl, messages)
 		if err != nil {
 			return err
 		}
@@ -251,13 +265,13 @@ func CleanOldUnread(client *http.Client, days int, action string, dryRun bool, s
 	}
 
 	fmt.Printf("Proceeding to %s %d emails...\n", action, len(messages))
-	return performBulkAction(srv, messages, action)
+	return performBulkAction(ctx, srv, rl, messages, action)
 }
 
 // getRepliedToAddresses returns a set of email addresses the user has sent mail to
-func getRepliedToAddresses(srv *gmail.Service) (map[string]bool, error) {
+func getRepliedToAddresses(ctx context.Context, srv *gmail.Service, rl *apiLimiter) (map[string]bool, error) {
 	fmt.Println("Collecting addresses you've sent mail to...")
-	messages, err := searchMessages(srv, "in:sent")
+	messages, err := searchMessages(ctx, srv, rl, "in:sent")
 	if err != nil {
 		return nil, err
 	}
@@ -274,8 +288,12 @@ func getRepliedToAddresses(srv *gmail.Service) (map[string]bool, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			m, err := srv.Users.Messages.Get("me", id).Format("metadata").MetadataHeaders("To").Do()
-			if err != nil {
+			var m *gmail.Message
+			if err := rl.do(ctx, func() error {
+				var err error
+				m, err = srv.Users.Messages.Get("me", id).Format("metadata").MetadataHeaders("To").Do()
+				return err
+			}); err != nil {
 				return
 			}
 			for _, h := range m.Payload.Headers {
@@ -296,8 +314,8 @@ func getRepliedToAddresses(srv *gmail.Service) (map[string]bool, error) {
 }
 
 // filterOutRepliedTo removes messages whose sender is someone the user has replied to
-func filterOutRepliedTo(srv *gmail.Service, messages []*gmail.Message) ([]*gmail.Message, error) {
-	repliedTo, err := getRepliedToAddresses(srv)
+func filterOutRepliedTo(ctx context.Context, srv *gmail.Service, rl *apiLimiter, messages []*gmail.Message) ([]*gmail.Message, error) {
+	repliedTo, err := getRepliedToAddresses(ctx, srv, rl)
 	if err != nil {
 		return nil, err
 	}
@@ -314,8 +332,12 @@ func filterOutRepliedTo(srv *gmail.Service, messages []*gmail.Message) ([]*gmail
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			meta, err := srv.Users.Messages.Get("me", m.Id).Format("metadata").MetadataHeaders("From").Do()
-			if err != nil {
+			var meta *gmail.Message
+			if err := rl.do(ctx, func() error {
+				var err error
+				meta, err = srv.Users.Messages.Get("me", m.Id).Format("metadata").MetadataHeaders("From").Do()
+				return err
+			}); err != nil {
 				mu.Lock()
 				filtered = append(filtered, m)
 				mu.Unlock()
@@ -363,12 +385,13 @@ func CleanPromotions(client *http.Client, action string, days int, dryRun bool) 
 	if err != nil {
 		return fmt.Errorf("unable to create Gmail service: %w", err)
 	}
+	rl := newAPILimiter()
 
 	cutoffDate := time.Now().AddDate(0, 0, -days)
 	query := fmt.Sprintf("category:promotions before:%s", cutoffDate.Format("2006/01/02"))
 
 	fmt.Printf("Searching for promotional emails older than %d days...\n", days)
-	messages, err := searchMessages(srv, query)
+	messages, err := searchMessages(ctx, srv, rl, query)
 	if err != nil {
 		return err
 	}
@@ -385,7 +408,7 @@ func CleanPromotions(client *http.Client, action string, days int, dryRun bool) 
 	}
 
 	fmt.Printf("Proceeding to %s %d emails...\n", action, len(messages))
-	return performBulkAction(srv, messages, action)
+	return performBulkAction(ctx, srv, rl, messages, action)
 }
 
 // CleanLargeAttachments removes emails with large attachments
@@ -395,11 +418,12 @@ func CleanLargeAttachments(client *http.Client, minSize string, action string, d
 	if err != nil {
 		return fmt.Errorf("unable to create Gmail service: %w", err)
 	}
+	rl := newAPILimiter()
 
 	query := fmt.Sprintf("has:attachment larger:%s", minSize)
 	fmt.Printf("Searching for emails with attachments larger than %s...\n", minSize)
 
-	messages, err := searchMessages(srv, query)
+	messages, err := searchMessages(ctx, srv, rl, query)
 	if err != nil {
 		return err
 	}
@@ -416,7 +440,7 @@ func CleanLargeAttachments(client *http.Client, minSize string, action string, d
 	}
 
 	fmt.Printf("Proceeding to %s %d emails...\n", action, len(messages))
-	return performBulkAction(srv, messages, action)
+	return performBulkAction(ctx, srv, rl, messages, action)
 }
 
 // FindAndUnsubscribe finds emails with unsubscribe links
@@ -426,11 +450,12 @@ func FindAndUnsubscribe(client *http.Client, autoUnsubscribe bool) error {
 	if err != nil {
 		return fmt.Errorf("unable to create Gmail service: %w", err)
 	}
+	rl := newAPILimiter()
 
 	query := "unsubscribe"
 	fmt.Println("Searching for emails with unsubscribe links...")
 
-	messages, err := searchMessages(srv, query)
+	messages, err := searchMessages(ctx, srv, rl, query)
 	if err != nil {
 		return err
 	}
@@ -445,7 +470,7 @@ func FindAndUnsubscribe(client *http.Client, autoUnsubscribe bool) error {
 
 // Helper functions
 
-func searchMessages(srv *gmail.Service, query string) ([]*gmail.Message, error) {
+func searchMessages(ctx context.Context, srv *gmail.Service, rl *apiLimiter, query string) ([]*gmail.Message, error) {
 	var allMessages []*gmail.Message
 	pageToken := ""
 
@@ -455,8 +480,12 @@ func searchMessages(srv *gmail.Service, query string) ([]*gmail.Message, error) 
 			req = req.PageToken(pageToken)
 		}
 
-		res, err := req.Do()
-		if err != nil {
+		var res *gmail.ListMessagesResponse
+		if err := rl.do(ctx, func() error {
+			var err error
+			res, err = req.Do()
+			return err
+		}); err != nil {
 			return nil, fmt.Errorf("unable to search messages: %w", err)
 		}
 
@@ -471,7 +500,7 @@ func searchMessages(srv *gmail.Service, query string) ([]*gmail.Message, error) 
 	return allMessages, nil
 }
 
-func performBulkAction(srv *gmail.Service, messages []*gmail.Message, action string) error {
+func performBulkAction(ctx context.Context, srv *gmail.Service, rl *apiLimiter, messages []*gmail.Message, action string) error {
 	batchSize := 1000
 	total := len(messages)
 
@@ -497,7 +526,9 @@ func performBulkAction(srv *gmail.Service, messages []*gmail.Message, action str
 			return fmt.Errorf("unknown action: %s", action)
 		}
 
-		if err := srv.Users.Messages.BatchModify("me", req).Do(); err != nil {
+		if err := rl.do(ctx, func() error {
+			return srv.Users.Messages.BatchModify("me", req).Do()
+		}); err != nil {
 			return fmt.Errorf("batch modify failed: %w", err)
 		}
 
