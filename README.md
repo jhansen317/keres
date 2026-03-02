@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="Keres" width="100%">
+</p>
+
 # Keres
 
 > Named after the Keres — spirits of violent death in Greek mythology, drawn to consume what is wasted and forgotten.

@@ -67,8 +67,9 @@ var gmailCleanPromotionsCmd = &cobra.Command{
 		action, _ := cmd.Flags().GetString("action")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		days, _ := cmd.Flags().GetInt("older-than")
+		exclude, _ := cmd.Flags().GetString("exclude")
 
-		return gmail.CleanPromotions(client, action, days, dryRun)
+		return gmail.CleanCategory(client, "promotions", action, days, dryRun, exclude)
 	},
 }
 
@@ -90,6 +91,25 @@ var gmailCleanLargeCmd = &cobra.Command{
 	},
 }
 
+var gmailCleanUpdatesCmd = &cobra.Command{
+	Use:   "clean-updates",
+	Short: "Clean updates/social/forums emails",
+	Long:  `Bulk archive or delete emails in the Updates, Social, or Forums categories.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		client, err := auth.GetGoogleClient([]string{"https://www.googleapis.com/auth/gmail.modify"})
+		if err != nil {
+			return fmt.Errorf("authentication required: run 'keres auth login'")
+		}
+
+		action, _ := cmd.Flags().GetString("action")
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		days, _ := cmd.Flags().GetInt("older-than")
+		category, _ := cmd.Flags().GetString("category")
+		exclude, _ := cmd.Flags().GetString("exclude")
+		return gmail.CleanCategory(client, category, action, days, dryRun, exclude)
+	},
+}
+
 var gmailUnsubscribeCmd = &cobra.Command{
 	Use:   "unsubscribe",
 	Short: "Find and unsubscribe from mailing lists",
@@ -101,7 +121,8 @@ var gmailUnsubscribeCmd = &cobra.Command{
 		}
 
 		autoUnsubscribe, _ := cmd.Flags().GetBool("auto")
-		return gmail.FindAndUnsubscribe(client, autoUnsubscribe)
+		exclude, _ := cmd.Flags().GetString("exclude")
+		return gmail.FindAndUnsubscribe(client, autoUnsubscribe, exclude)
 	},
 }
 
@@ -112,6 +133,7 @@ func init() {
 	gmailCmd.AddCommand(gmailCleanPromotionsCmd)
 	gmailCmd.AddCommand(gmailCleanLargeCmd)
 	gmailCmd.AddCommand(gmailUnsubscribeCmd)
+	gmailCmd.AddCommand(gmailCleanUpdatesCmd)
 
 	// Analyze flags
 	gmailAnalyzeCmd.Flags().Int("limit", 1000, "Number of emails to analyze")
@@ -132,6 +154,17 @@ func init() {
 	gmailCleanLargeCmd.Flags().String("action", "archive", "Action to take: archive or delete")
 	gmailCleanLargeCmd.Flags().Bool("dry-run", true, "Preview changes without applying them")
 
+	// Clean promotions exclude
+	gmailCleanPromotionsCmd.Flags().String("exclude", "", "Comma-separated emails or domains to exclude")
+
+	// Clean updates flags
+	gmailCleanUpdatesCmd.Flags().String("category", "updates", "Category to clean: updates, social, or forums")
+	gmailCleanUpdatesCmd.Flags().String("action", "archive", "Action to take: archive or delete")
+	gmailCleanUpdatesCmd.Flags().Bool("dry-run", true, "Preview changes without applying them")
+	gmailCleanUpdatesCmd.Flags().Int("older-than", 30, "Only clean emails older than this many days")
+	gmailCleanUpdatesCmd.Flags().String("exclude", "", "Comma-separated emails or domains to exclude")
+
 	// Unsubscribe flags
 	gmailUnsubscribeCmd.Flags().Bool("auto", false, "Automatically unsubscribe (use with caution)")
+	gmailUnsubscribeCmd.Flags().String("exclude", "", "Comma-separated emails or domains to exclude (e.g. \"github.com,news@example.com\")")
 }
