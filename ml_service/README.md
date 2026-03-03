@@ -142,6 +142,29 @@ curl -X POST http://localhost:5000/index/batch \
   }'
 ```
 
+### POST /index/all
+Discover all photos from your macOS Photos library and index them. Runs in the background.
+
+```bash
+curl -X POST http://localhost:5000/index/all \
+  -H "Content-Type: application/json" \
+  -d '{"skip_indexed": true}'
+```
+
+### GET /index/status
+Poll indexing progress.
+
+```bash
+curl http://localhost:5000/index/status
+```
+
+### POST /index/cancel
+Cancel a running indexing job. Already-indexed photos are kept.
+
+```bash
+curl -X POST http://localhost:5000/index/cancel
+```
+
 ### GET /stats
 Get indexing statistics.
 
@@ -250,8 +273,8 @@ For production use, consider:
 
 ## Future Enhancements
 
+- [x] Progressive indexing (index new photos only)
 - [ ] Batch processing optimization
-- [ ] Progressive indexing (index new photos only)
 - [ ] Multi-GPU support
 - [ ] Face recognition integration
 - [ ] Automatic tagging based on content

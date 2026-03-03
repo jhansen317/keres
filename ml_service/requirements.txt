@@ -1,5 +1,6 @@
-flask==3.0.0
-torch==2.1.2
-transformers==4.36.2
-pillow==10.2.0
-numpy==1.26.3
+flask>=3.0.0
+torch>=2.9.0
+transformers>=4.36.0
+pillow>=10.2.0
+pillow-heif>=0.18.0
+numpy>=1.26.0

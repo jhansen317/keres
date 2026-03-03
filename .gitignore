@@ -37,3 +37,11 @@ token.json
 # Build artifacts
 dist/
 build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ML service logs
+ml_service/*.log
