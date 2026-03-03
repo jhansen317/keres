@@ -1,11 +1,18 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
 
 	"github.com/jhansen317/keres/internal/photos"
 	"github.com/spf13/cobra"
 )
+
+const mlServiceURL = "http://localhost:5001"
 
 var photosCmd = &cobra.Command{
 	Use:   "photos",
@@ -71,24 +78,50 @@ Examples:
   keres photos search "photos of my dog"
   keres photos search "food pictures"
 
-Note: This feature requires the ML service to be running.
-      Run: cd ml_service && python app.py`,
+Requires the ML service to be running: cd ml_service && python app.py`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		query := args[0]
 		limit, _ := cmd.Flags().GetInt("limit")
 
-		fmt.Printf("Searching for: %s\n", query)
-		fmt.Println("\nSemantic search requires the ML service.")
-		fmt.Println("To enable this feature:")
-		fmt.Println("  1. cd ml_service")
-		fmt.Println("  2. pip install -r requirements.txt")
-		fmt.Println("  3. python app.py")
-		fmt.Println("\nSee docs/ICLOUD_DESIGN.md for details.")
+		if err := checkMLService(); err != nil {
+			return err
+		}
 
-		// TODO: Implement API call to ML service
-		_ = limit
-		_ = query
+		fmt.Printf("Searching for: %s\n\n", query)
+
+		body := fmt.Sprintf(`{"query": %q, "limit": %d}`, query, limit)
+		resp, err := http.Post(mlServiceURL+"/search", "application/json", strings.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("failed to call ML service: %w", err)
+		}
+		defer resp.Body.Close()
+
+		var result struct {
+			Query        string `json:"query"`
+			TotalIndexed int    `json:"total_indexed"`
+			Message      string `json:"message"`
+			Results      []struct {
+				UUID  string  `json:"uuid"`
+				Path  string  `json:"path"`
+				Score float64 `json:"score"`
+			} `json:"results"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+
+		if result.Message != "" {
+			fmt.Println(result.Message)
+			return nil
+		}
+
+		fmt.Printf("Results (%d indexed photos searched):\n\n", result.TotalIndexed)
+		for i, r := range result.Results {
+			scoreBar := renderScore(r.Score)
+			fmt.Printf("%2d. %s %.3f  %s\n", i+1, scoreBar, r.Score, r.Path)
+		}
 
 		return nil
 	},
@@ -100,19 +133,155 @@ var photosIndexCmd = &cobra.Command{
 	Long: `Generate CLIP embeddings for all photos in your library.
 This is required before using semantic search.
 
-Note: This can take several hours for large libraries (10k+ photos).`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Println("Generating embeddings for all photos...")
-		fmt.Println("\nThis feature requires the ML service.")
-		fmt.Println("To enable this feature:")
-		fmt.Println("  1. cd ml_service")
-		fmt.Println("  2. pip install -r requirements.txt")
-		fmt.Println("  3. python app.py")
-		fmt.Println("\nSee docs/ICLOUD_DESIGN.md for details.")
+Requires the ML service to be running: cd ml_service && python app.py
 
-		// TODO: Implement API call to ML service
-		return nil
+Already-indexed photos are skipped by default. Use --reindex to re-process everything.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		reindex, _ := cmd.Flags().GetBool("reindex")
+
+		if err := checkMLService(); err != nil {
+			return err
+		}
+
+		// Start indexing
+		skipIndexed := !reindex
+		body := fmt.Sprintf(`{"skip_indexed": %t}`, skipIndexed)
+		resp, err := http.Post(mlServiceURL+"/index/all", "application/json", strings.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("failed to start indexing: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusConflict {
+			fmt.Println("Indexing is already in progress.")
+			fmt.Println("Run 'keres photos index --status' to check progress.")
+			return nil
+		}
+
+		var startResult struct {
+			Status         string `json:"status"`
+			TotalInLibrary int    `json:"total_in_library"`
+			AlreadyIndexed int    `json:"already_indexed"`
+			Error          string `json:"error"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&startResult); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+
+		if startResult.Error != "" {
+			return fmt.Errorf("indexing error: %s", startResult.Error)
+		}
+
+		fmt.Printf("Indexing started\n")
+		fmt.Printf("  Photos in library: %d\n", startResult.TotalInLibrary)
+		if skipIndexed && startResult.AlreadyIndexed > 0 {
+			fmt.Printf("  Already indexed:   %d (skipping)\n", startResult.AlreadyIndexed)
+		}
+		fmt.Println()
+
+		// Poll for progress
+		return pollIndexStatus()
 	},
+}
+
+func pollIndexStatus() error {
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for {
+		time.Sleep(2 * time.Second)
+
+		resp, err := client.Get(mlServiceURL + "/index/status")
+		if err != nil {
+			fmt.Printf("\rFailed to get status: %v", err)
+			continue
+		}
+
+		var status struct {
+			Running        bool    `json:"running"`
+			Total          int     `json:"total"`
+			Indexed        int     `json:"indexed"`
+			Skipped        int     `json:"skipped"`
+			Failed         int     `json:"failed"`
+			CurrentFile    string  `json:"current_file"`
+			ElapsedSeconds float64 `json:"elapsed_seconds"`
+			ImagesPerSec   float64 `json:"images_per_second"`
+			Error          string  `json:"error"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+
+		if status.Error != "" {
+			return fmt.Errorf("indexing failed: %s", status.Error)
+		}
+
+		if status.Total > 0 {
+			pct := float64(status.Indexed) / float64(status.Total) * 100
+			rateStr := ""
+			if status.ImagesPerSec > 0 {
+				remaining := float64(status.Total-status.Indexed) / status.ImagesPerSec
+				rateStr = fmt.Sprintf("  %.1f img/s  ~%s remaining", status.ImagesPerSec, formatDuration(remaining))
+			}
+			fmt.Printf("\r  [%3.0f%%] %d/%d indexed, %d failed%s   ",
+				pct, status.Indexed, status.Total, status.Failed, rateStr)
+		} else {
+			fmt.Printf("\r  Discovering photos...   ")
+		}
+
+		if !status.Running {
+			fmt.Printf("\n\nIndexing complete!\n")
+			fmt.Printf("  Indexed: %d\n", status.Indexed)
+			if status.Skipped > 0 {
+				fmt.Printf("  Skipped: %d (already indexed)\n", status.Skipped)
+			}
+			if status.Failed > 0 {
+				fmt.Printf("  Failed:  %d\n", status.Failed)
+			}
+			if status.ElapsedSeconds > 0 {
+				fmt.Printf("  Time:    %s\n", formatDuration(status.ElapsedSeconds))
+			}
+			return nil
+		}
+	}
+}
+
+func checkMLService() error {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(mlServiceURL + "/health")
+	if err != nil {
+		return fmt.Errorf("ML service is not running at %s\n\n"+
+			"Start it with:\n"+
+			"  cd ml_service && python app.py", mlServiceURL)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+func renderScore(score float64) string {
+	filled := int(score * 10)
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > 10 {
+		filled = 10
+	}
+	return "[" + strings.Repeat("#", filled) + strings.Repeat(" ", 10-filled) + "]"
+}
+
+func formatDuration(seconds float64) string {
+	d := time.Duration(seconds * float64(time.Second))
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
 func init() {
@@ -122,11 +291,9 @@ func init() {
 	photosCmd.AddCommand(photosSearchCmd)
 	photosCmd.AddCommand(photosIndexCmd)
 
-	// Largest flags
 	photosLargestCmd.Flags().Int("limit", 50, "Number of items to show")
-
-	// Search flags
 	photosSearchCmd.Flags().Int("limit", 20, "Number of results to return")
+	photosIndexCmd.Flags().Bool("reindex", false, "Re-index all photos (ignore existing embeddings)")
 }
 
 func formatBytesPhotos(bytes int64) string {

@@ -13,8 +13,13 @@ import (
 
 const (
 	photosLibraryPath = "Pictures/Photos Library.photoslibrary"
-	photosDatabasePath = "database/photos.db"
 )
+
+// Modern macOS (Ventura+) uses Photos.sqlite; older versions use photos.db
+var photosDatabaseCandidates = []string{
+	"database/Photos.sqlite",
+	"database/photos.db",
+}
 
 type PhotoInfo struct {
 	UUID         string
@@ -50,12 +55,21 @@ func GetPhotosLibraryPath() (string, error) {
 	}
 
 	libraryPath := filepath.Join(home, photosLibraryPath)
-	dbPath := filepath.Join(libraryPath, photosDatabasePath)
 
-	// Check if Photos library exists
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("Photos library database not found at %s\n"+
-			"Make sure Photos.app is installed and has been opened at least once", dbPath)
+	// Try each candidate database path
+	var dbPath string
+	for _, candidate := range photosDatabaseCandidates {
+		p := filepath.Join(libraryPath, candidate)
+		if _, err := os.Stat(p); err == nil {
+			dbPath = p
+			break
+		}
+	}
+
+	if dbPath == "" {
+		return "", fmt.Errorf("Photos library database not found in %s\n"+
+			"Make sure Photos.app is installed and has been opened at least once",
+			filepath.Join(libraryPath, "database"))
 	}
 
 	return dbPath, nil
